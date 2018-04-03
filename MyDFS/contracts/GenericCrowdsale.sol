@@ -4,18 +4,13 @@ import './Ownable.sol';
 import "./SafeMath.sol";
 import "./interface/ERC223_interface.sol";
 import "./DevTokensHolder.sol";
-import "./GrowthTokensHolder.sol";
+import "./AdvisorsTokensHolder.sol";
 
 contract GenericCrowdsale is Ownable {
     using SafeMath for uint256;
 
     //Crowrdsale states
-    enum State { Initialized, PreIco, Ico }
-
-    struct Deal {
-        address user;
-        uint256 amount;
-    }
+    enum State { Initialized, PreIco, PreIcoFinished, Ico, IcoFinished}
 
     struct Discount {
         uint256 amount;
@@ -32,12 +27,14 @@ contract GenericCrowdsale is Ownable {
     uint public softFundingGoal;
     //gathered Ether amount in Wei
     uint public amountRaised;
-    //ICO/PreICO finish timestamp in seconds
-    uint public deadline;
+    //ICO/PreICO start timestamp in seconds
+    uint public started;
     //Crowdsale finish time
     uint public finishTime;
     //price for 1 token in Wei
     uint public price;
+    //minimum purchase value in Wei
+    uint public minPurchase;
     //Token cantract
     ERC223 public tokenReward;
     //Wei balances for refund if ICO failed
@@ -49,39 +46,33 @@ contract GenericCrowdsale is Ownable {
     bool softCapReached = false;
     //dev holder
     DevTokensHolder public devTokensHolder;
-    //growth holder
-    GrowthTokensHolder public growthTokensHolder;
+    //advisors holder
+    AdvisorsTokensHolder public advisorsTokensHolder;
     
     //Disconts
     Discount[] public discounts;
-    //Purchase stages for bonus distribution
-    mapping(address => uint256)[10] public stages;
-    //Bonus values for stages
-    uint8[10] public bonuses = [0,1,2,3,5,8,13,21,34,55];
-     //Last sell stage
-    uint256 maxStage = 0;
-    //Purchase stages for bonus distribution
-    mapping(address => bool) public bonusSent;
+
+    //price overhead for next stages
+    uint8[2] public preIcoTokenPrice = [70,75];
+    //price overhead for next stages
+    uint8[4] public icoTokenPrice = [100,120,125,130];
 
     event TokenPurchased(address investor, uint sum, uint tokensCount, uint discountTokens);
     event PreIcoLimitReached(uint totalAmountRaised);
     event SoftGoalReached(uint totalAmountRaised);
     event HardGoalReached(uint totalAmountRaised);
-    event Refund(address investor, uint sum);
     event Debug(uint num);
-
 
     //Sale is active
     modifier sellActive() { 
         require(
             !emergencyPaused 
-            && state > State.Initialized
-            && now < deadline 
+            && (state == State.PreIco || state == State.Ico)
             && amountRaised < hardFundingGoal
         );
     _; }
     //Soft cap not reached
-    modifier goalNotReached() { require(state == State.Ico && amountRaised < softFundingGoal && now > deadline); _; }
+    modifier goalNotReached() { require(state == State.IcoFinished && amountRaised < softFundingGoal); _; }
 
     /**
      * Constrctor function
@@ -113,26 +104,25 @@ contract GenericCrowdsale is Ownable {
      */
     function preIco(
         uint hardFundingGoalInEthers,
-        uint durationInSeconds,
-        uint szaboCostOfEachToken,
-        uint256[] discountTokenAmount,
+        uint minPurchaseInFinney,
+        uint costOfEachToken,
+        uint256[] discountEthers,
         uint256[] discountValues
     ) 
         external 
         onlyOwner 
     {
         require(hardFundingGoalInEthers > 0
-            && durationInSeconds > 0
-            && szaboCostOfEachToken > 0
+            && costOfEachToken > 0
             && state == State.Initialized
-            && discountTokenAmount.length == discountValues.length);
+            && discountEthers.length == discountValues.length);
 
         hardFundingGoal = hardFundingGoalInEthers.mul(1 ether);
-        deadline = now.add(durationInSeconds.mul(1 seconds));
-        finishTime = deadline;
-        price = szaboCostOfEachToken.mul(1 szabo);
-        initDiscounts(discountTokenAmount, discountValues);
+        minPurchase = minPurchaseInFinney.mul(1 finney);
+        price = costOfEachToken;
+        initDiscounts(discountEthers, discountValues);
         state = State.PreIco;
+        started = now;
     }
 
     /**
@@ -141,9 +131,9 @@ contract GenericCrowdsale is Ownable {
     function ico(
         uint softFundingGoalInEthers,
         uint hardFundingGoalInEthers,
-        uint durationInSeconds,
-        uint szaboCostOfEachToken,
-        uint256[] discountTokenAmount,
+        uint minPurchaseInFinney,
+        uint costOfEachToken,
+        uint256[] discountEthers,
         uint256[] discountValues
     ) 
         external
@@ -152,19 +142,30 @@ contract GenericCrowdsale is Ownable {
         require(softFundingGoalInEthers > 0
             && hardFundingGoalInEthers > 0
             && hardFundingGoalInEthers > softFundingGoalInEthers
-            && durationInSeconds > 0
-            && szaboCostOfEachToken > 0
+            && costOfEachToken > 0
             && state < State.Ico
-            && discountTokenAmount.length == discountValues.length);
+            && discountEthers.length == discountValues.length);
 
         softFundingGoal = softFundingGoalInEthers.mul(1 ether);
         hardFundingGoal = hardFundingGoalInEthers.mul(1 ether);
-        deadline = now.add(durationInSeconds.mul(1 seconds));
-        finishTime = deadline;
-        price = szaboCostOfEachToken.mul(1 szabo);
+        minPurchase = minPurchaseInFinney.mul(1 finney);
+        price = costOfEachToken;
         delete discounts;
-        initDiscounts(discountTokenAmount, discountValues);
+        initDiscounts(discountEthers, discountValues);
         state = State.Ico;
+        started = now;
+    }
+
+    /**
+     * Finish ICO / PreICO
+     */
+    function finishSale() external onlyOwner {
+        require(state == State.PreIco || state == State.Ico);
+        
+        if (state == State.PreIco)
+            state = State.PreIcoFinished;
+        else
+            state = State.IcoFinished;
     }
 
     /**
@@ -188,19 +189,19 @@ contract GenericCrowdsale is Ownable {
         require(successed());
 
         devTokensHolder = new DevTokensHolder(address(this), address(tokenReward), owner);
-        tokenReward.transfer(address(devTokensHolder), 50 * 1e12);
+        tokenReward.transfer(address(devTokensHolder), 12500 * 1e9);
         return address(devTokensHolder);
     }
 
     /**
      * Transfer dev tokens to vesting wallet
      */
-    function sendGrowthTokens() external onlyOwner returns(address) {
+    function sendAdvisorsTokens() external onlyOwner returns(address) {
         require(successed());
 
-        growthTokensHolder = new GrowthTokensHolder(address(this), address(tokenReward), owner);
-        tokenReward.transfer(address(growthTokensHolder), 150 * 1e12);
-        return address(growthTokensHolder);
+        advisorsTokensHolder = new AdvisorsTokensHolder(address(this), address(tokenReward), owner);
+        tokenReward.transfer(address(advisorsTokensHolder), 12500 * 1e9);
+        return address(advisorsTokensHolder);
     }
 
     /**
@@ -224,32 +225,6 @@ contract GenericCrowdsale is Ownable {
     }
 
     /**
-     * Claim bonus after ICO finished successfully 
-     */
-    function claimBonus() 
-        external 
-    {
-        require(successed());
-        require(!bonusSent[msg.sender]);
-        address user = msg.sender;
-
-        uint256 total_bonus = 0;
-        for (uint8 i = 0; i < 10; i++) {
-            uint256 purchase = stages[i][user];
-            if (purchase > 0) {
-                uint256 stage_bonus_percent = bonuses[maxStage.sub(i)];
-                uint256 token_bonus = (purchase.mul(stage_bonus_percent).div(100)).div(price);
-                total_bonus = total_bonus.add(token_bonus);
-            }
-        }
-
-        if (total_bonus > 0) {
-            tokenReward.transfer(user, total_bonus);
-            bonusSent[user] = true;
-        }
-    }
-
-    /**
      * Claim refund ether in soft goal not reached 
      */
     function claimRefund() 
@@ -259,9 +234,7 @@ contract GenericCrowdsale is Ownable {
         uint256 amount = balances[msg.sender];
         balances[msg.sender] = 0;
         if (amount > 0){
-            if (msg.sender.send(amount)) {
-                Refund(msg.sender, amount);
-            } else {
+            if (!msg.sender.send(amount)) {
                 balances[msg.sender] = amount;
             }
         }
@@ -273,15 +246,15 @@ contract GenericCrowdsale is Ownable {
     function () 
         external 
         payable 
-        //sellActive 
+        sellActive
     {
         require(msg.value > 0);
+        require(msg.value >= minPurchase);
         uint amount = msg.value;
         if (amount > hardFundingGoal.sub(amountRaised)) {
             uint availableAmount = hardFundingGoal.sub(amountRaised);
             msg.sender.transfer(amount.sub(availableAmount));
             amount = availableAmount;
-            Debug(amount);
         }
 
         buyTokens(msg.sender,  amount);
@@ -297,16 +270,38 @@ contract GenericCrowdsale is Ownable {
     ) internal {
     	require(amount <= hardFundingGoal.sub(amountRaised));
 
-        uint256 count = amount.div(price).add(amount % price > 0 ? 1 : 0);
-        uint256 discount = getDiscountOf(count);
-        uint256 discountBonus = discount.mul(count).div(100).add(discount.mul(count) % 100 > 0 ? 1 : 0);
+        uint256 passedSeconds = getTime().sub(started);
+        uint256 week = 0;
+        if (passedSeconds >= 604800){
+            week = passedSeconds.div(604800);
+        }
+        Debug(week);
+
+        uint256 tokenPrice;
+        if (state == State.Ico){
+            uint256 cup = amountRaised.mul(4).div(hardFundingGoal);
+            if (cup > week)
+                week = cup;
+            if (week >= 4)
+                 week = 3;
+            tokenPrice = price.mul(icoTokenPrice[week]).div(100);
+        } else {
+            if (week >= 2)
+                 week = 1;
+            tokenPrice = price.mul(preIcoTokenPrice[week]).div(100);
+        }
+
+        Debug(tokenPrice);
+
+        uint256 count = amount.div(tokenPrice);
+        uint256 discount = getDiscountOf(amount);
+        uint256 discountBonus = discount.mul(count).div(100);
         count = count.add(discountBonus);
 
         require(tokenReward.transfer(user, count));
         balances[user] = balances[user].add(amount);
         amountRaised = amountRaised.add(amount);
-        storeStage(user, amount);
-        TokenPurchased(msg.sender, amount, count, discountBonus);
+        TokenPurchased(user, amount, count, discountBonus);
     }
 
     /**
@@ -317,18 +312,18 @@ contract GenericCrowdsale is Ownable {
         view 
         returns(bool) 
     {
-        return (state == State.Ico) && ((now >= deadline && amountRaised >= softFundingGoal) || amountRaised >= hardFundingGoal);
+        return state == State.IcoFinished && amountRaised >= softFundingGoal;
     }
 
     /**
      * Define distount percents for different token amounts
      */
     function initDiscounts(
-        uint256[] discountTokenAmount,
+        uint256[] discountEthers,
         uint256[] discountValues
     ) internal {
-        for (uint256 i = 0; i < discountTokenAmount.length; i++) {
-            discounts.push(Discount(discountTokenAmount[i], discountValues[i]));
+        for (uint256 i = 0; i < discountEthers.length; i++) {
+            discounts.push(Discount(discountEthers[i].mul(1 ether), discountValues[i]));
         }
     }
 
@@ -336,7 +331,7 @@ contract GenericCrowdsale is Ownable {
      * Get discount percent for number of tokens
      */
     function getDiscountOf(
-        uint256 count
+        uint256 _amount
     )
         public
         view
@@ -344,36 +339,11 @@ contract GenericCrowdsale is Ownable {
     {
         if (discounts.length > 0)
             for (uint256 i = 0; i < discounts.length; i++) {
-                if (count >= discounts[i].amount) {
+                if (_amount >= discounts[i].amount) {
                     return discounts[i].value;
                 }
             }
         return 0;
-    }
-
-    /**
-     * Store purchase stage for further receiving bonuses
-     */
-    function storeStage(
-        address user, 
-        uint256 amount
-    ) internal {
-        uint256 before_stage = amountRaised.sub(amount).mul(10).div(hardFundingGoal);
-        uint256 after_stage = amountRaised.mul(10).div(hardFundingGoal);
-        
-        if (before_stage != after_stage) {
-            uint256 stage_amount = hardFundingGoal.div(10);
-            uint256 part1 = stage_amount.sub(amountRaised.sub(amount) % stage_amount);
-            stages[before_stage][user] = stages[before_stage][user].add(part1);
-            uint256 part2 = amount.sub(part1);
-            if (part2 > 0)
-                storeStage(user, part2);
-            else
-                maxStage = before_stage;
-        } else {
-            stages[before_stage][user] = stages[before_stage][user].add(amount);
-            maxStage = before_stage;
-        }
     }
 
     /**
@@ -383,6 +353,7 @@ contract GenericCrowdsale is Ownable {
         if (state == State.PreIco) {
             if (amountRaised >= hardFundingGoal) {
                 PreIcoLimitReached(amountRaised);
+                state = State.PreIcoFinished;
             }
         } else {
             if (!softCapReached && amountRaised >= softFundingGoal){
@@ -392,7 +363,12 @@ contract GenericCrowdsale is Ownable {
             if (amountRaised >= hardFundingGoal) {
                 finishTime = now;
                 HardGoalReached(amountRaised);
+                state = State.IcoFinished;
             }
         }
+    }
+
+    function getTime() internal view returns (uint) {
+        return now;
     }
 }
